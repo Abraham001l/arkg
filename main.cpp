@@ -17,68 +17,48 @@ int main(int argc, char** argv) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    // creating 1GB shared memory
-    MPI_Comm shm_comm;
-    MPI_Comm_split_type(
-        MPI_COMM_WORLD, 
-        MPI_COMM_TYPE_SHARED, 
-        0, 
-        MPI_INFO_NULL, 
-        &shm_comm);
+    // picking master rank for doc retrieval
+    int master_rank;
+    bool doc_retriever_found = pick_doc_retriever("test_text_files", rank, master_rank);
 
-    MPI_Win shm_window;
-    void* shm_data_ptr = nullptr;
+    if (!doc_retriever_found) {
+        printf("No doc retriever found.\n");
+        MPI_Finalize();
+        return 1;
+    }
 
-    MPI_Aint shm_size = (rank == 0) ? sizeof(char) * one_GB : 0;
+    // creating work container for each rank
+    work_container w = {0};
 
-    MPI_Win_allocate_shared(
-        shm_size, 
-        sizeof(char), 
-        MPI_INFO_NULL, 
-        shm_comm, 
-        &shm_data_ptr, 
-        &shm_window);
+    // having the master rank create 1GB of shared memory to read in docs
+    if (rank == master_rank) {
+        // allocating mem to read docs into
+        auto mem = make_unique_for_overwrite<char[]>(one_GB);
+        char* base_ptr = mem.get();
 
-    // getting pointer to rank 0 shm
-    MPI_Aint shm_tot_bytes;
-    int displacement_unit;
-    char* shm_base_ptr;
+        // skeleton struct for docs
+        docs_container d = {sizeof(size_t)*3, 0, 0};
 
-    MPI_Win_shared_query(
-        shm_window, 
-        0, 
-        &shm_tot_bytes, 
-        &displacement_unit, 
-        &shm_base_ptr);
-    
-    // having rank 0 fill in shm and assigning rank offsets
-    MPI_Win_lock_all(0, shm_window);
-    
-    // skeleton struct for docs
-    docs_container d = {sizeof(size_t)*3, 0, 0};
-
-    if (rank == 0) {
+        // reading docs into mem
         vector<string> doc_paths = {"test_text_files/doc1.txt", "test_text_files/doc2.txt", "test_text_files/doc3.txt", "test_text_files/doc4.txt",
         "test_text_files/doc5.txt", "test_text_files/doc6.txt", "test_text_files/doc7.txt", "test_text_files/doc8.txt", "test_text_files/doc9.txt",
         "test_text_files/doc10.txt"};
 
-        populate_docs_container(d, shm_base_ptr, doc_paths);
-        calc_rank_offsets(d, shm_base_ptr, world_size);
+        populate_docs_container(d, base_ptr, doc_paths);
+        calc_rank_offsets(d, base_ptr, world_size);
+
+        // distributing docs to other ranks
+        distribute_docs_to_ranks(d, base_ptr, world_size, rank);
+
+        // filling work container for master rank
+        fill_work_container_for_master_rank(w, d, base_ptr, rank);
+
+        // freeing the docs container
+        free_docs_container(d);
+    } else {
+        // receiving docs from master rank
+        receive_docs_from_master(w, master_rank);
     }
-
-    // synchronizing shm for processes
-    MPI_Win_sync(shm_window);
-    MPI_Barrier(shm_comm);
-    MPI_Win_sync(shm_window);
-
-    // having other ranks define skeleton struct for docs
-    if (rank != 0) {
-        interpret_filled_docs_container(d, shm_base_ptr, world_size);
-    }
-
-    // creating & filling work containers
-    work_container w = {0};
-    fill_work_container(w, d, shm_base_ptr, rank);
 
     // chunking the work memory into lines
     std::vector<std::string_view> chunks;
@@ -105,8 +85,5 @@ int main(int argc, char** argv) {
         printf("\n");
     }
 
-    MPI_Win_unlock_all(shm_window);
-    MPI_Win_free(&shm_window);
-    MPI_Comm_free(&shm_comm);
     MPI_Finalize();
 }
