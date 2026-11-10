@@ -40,9 +40,11 @@ int main(int argc, char** argv) {
         docs_container d = {sizeof(size_t)*3, 0, 0};
 
         // reading docs into mem
-        vector<string> doc_paths = {"test_text_files/doc1.txt", "test_text_files/doc2.txt", "test_text_files/doc3.txt", "test_text_files/doc4.txt",
-        "test_text_files/doc5.txt", "test_text_files/doc6.txt", "test_text_files/doc7.txt", "test_text_files/doc8.txt", "test_text_files/doc9.txt",
-        "test_text_files/doc10.txt"};
+        vector<string> doc_paths;
+        doc_paths.reserve(20);
+        for (int i = 1; i <= 20; ++i) {
+            doc_paths.push_back("test_text_files/doc" + to_string(i) + ".txt");
+        }
 
         populate_docs_container(d, base_ptr, doc_paths);
         calc_rank_offsets(d, base_ptr, world_size);

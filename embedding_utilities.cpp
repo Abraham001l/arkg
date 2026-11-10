@@ -132,18 +132,25 @@ public:
 
 void chunk_memory(work_container& w, std::vector<std::string_view> &chunks) {
     chunks.clear();
+    constexpr size_t max_chunk_bytes = 512;
     size_t start = 0;
 
-    for (size_t i = 0; i < w.work_mem.size(); ++i) {
-        if (w.work_mem[i] == '\n') {
-            chunks.emplace_back(w.work_mem.data() + start, i - start);
-            start = i + 1;
+    while (start < w.work_mem.size()) {
+        size_t end = start + std::min(max_chunk_bytes, w.work_mem.size() - start);
+
+        // Keep a multibyte UTF-8 character entirely in the next chunk.
+        if (end < w.work_mem.size()) {
+            while (end > start &&
+                   (static_cast<unsigned char>(w.work_mem[end]) & 0xC0) == 0x80) {
+                --end;
+            }
+            if (end == start) {
+                throw std::runtime_error("Invalid UTF-8 at chunk boundary");
+            }
         }
-    }
-    
-    // keep the final line even when it has no terminating newline.
-    if (start < w.work_mem.size()) {
-        chunks.emplace_back(w.work_mem.data() + start, w.work_mem.size() - start);
+
+        chunks.emplace_back(w.work_mem.data() + start, end - start);
+        start = end;
     }
 }
 

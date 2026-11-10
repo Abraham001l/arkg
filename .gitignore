@@ -11,3 +11,6 @@
 /.aws/
 /.codex/
 /.agents/
+
+# local test files
+/test_text_files/
