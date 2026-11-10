@@ -8,4 +8,5 @@ exec ./llama.cpp/build/bin/llama-server \
   --embedding \
   --host 127.0.0.1 \
   --port 8080 \
-  --parallel 8
+  --parallel 8 \
+  "$@"
