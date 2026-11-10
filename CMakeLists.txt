@@ -6,10 +6,10 @@ find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(BLAS REQUIRED)
 
 add_executable(fast_rag
-    main.cpp
-    doc_utilities.cpp
-    embedding_utilities.cpp
-    graph_utilities.cpp
+    src/main.cpp
+    src/doc_utilities.cpp
+    src/embedding_utilities.cpp
+    src/graph_utilities.cpp
 )
 
 target_link_libraries(fast_rag PRIVATE ${BLAS_LIBRARIES})
