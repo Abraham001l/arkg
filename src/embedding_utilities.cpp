@@ -8,10 +8,10 @@ class embedding_reader : public nlohmann::json_sax<nlohmann::json> {
     enum class scope { root, data, entry, embedding, ignored };
     std::vector<scope> stack;
     std::string field;
-    std::vector<float>& output;
+    span<float> output;
     size_t count;
-    size_t dimensions = 0;
-    size_t row_start = 0;
+    size_t dimensions;
+    size_t row_width = 0;
     size_t index = 0;
     bool has_index = false;
     bool has_embedding = false;
@@ -29,14 +29,15 @@ class embedding_reader : public nlohmann::json_sax<nlohmann::json> {
 
     bool value(double number) {
         if (current() != scope::embedding) return scalar_allowed();
-        if (!std::isfinite(number) || std::abs(number) > std::numeric_limits<float>::max()) return false;
-        output.push_back(static_cast<float>(number));
+        if (row_width == dimensions || !std::isfinite(number) ||
+            std::abs(number) > std::numeric_limits<float>::max()) return false;
+        output[indices.size() * dimensions + row_width++] = static_cast<float>(number);
         return true;
     }
 
 public:
-    embedding_reader(std::vector<float>& output, size_t count)
-        : output(output), count(count), seen(count, false) {
+    embedding_reader(span<float> output, size_t count)
+        : output(output), count(count), dimensions(output.size() / count), seen(count, false) {
         indices.reserve(count);
     }
 
@@ -66,7 +67,7 @@ public:
             stack.push_back(scope::root);
         } else if (current() == scope::data) {
             if (indices.size() == count) return false;
-            row_start = output.size();
+            row_width = 0;
             has_index = has_embedding = false;
             stack.push_back(scope::entry);
         } else {
@@ -77,15 +78,7 @@ public:
     }
     bool end_object() override {
         if (current() == scope::entry) {
-            if (!has_index || !has_embedding) return false;
-            const size_t width = output.size() - row_start;
-            if (width == 0 || (dimensions != 0 && width != dimensions)) return false;
-            if (dimensions == 0) {
-                dimensions = width;
-                if (count > output.max_size() / dimensions) return false;
-                // Once the first row tells us its width, allocate for the whole batch.
-                output.reserve(count * dimensions);
-            }
+            if (!has_index || !has_embedding || row_width != dimensions) return false;
             seen[index] = true;
             indices.push_back(index);
         }
@@ -130,32 +123,49 @@ public:
 };
 }
 
-void chunk_memory(work_container& w, std::vector<std::string_view> &chunks) {
+void chunk_memory(const docs_container& local_docs, const int thread_id, vector<string_view>& chunks) {
     chunks.clear();
     constexpr size_t max_chunk_bytes = 512;
+    const auto& text = local_docs.doc_mem;
+    const auto& offsets = local_docs.worker_offsets;
+    const size_t worker = static_cast<size_t>(thread_id);
+    const size_t worker_start = offsets.at(worker);
+    const size_t worker_end = worker + 1 < offsets.size() ? offsets[worker + 1] : text.size();
+    if (worker_start == worker_end) return;
+
+    // Find the first document by summing sizes up to this worker's byte offset.
+    size_t doc_index = 0;
     size_t start = 0;
+    while (start < worker_start) {
+        start += local_docs.doc_sizes[doc_index++];
+    }
 
-    while (start < w.work_mem.size()) {
-        size_t end = start + std::min(max_chunk_bytes, w.work_mem.size() - start);
+    while (start < worker_end) {
+        const size_t doc_end = start + local_docs.doc_sizes[doc_index++];
+        while (start < doc_end) {
+            size_t end = start + std::min(max_chunk_bytes, doc_end - start);
 
-        // Keep a multibyte UTF-8 character entirely in the next chunk.
-        if (end < w.work_mem.size()) {
-            while (end > start &&
-                   (static_cast<unsigned char>(w.work_mem[end]) & 0xC0) == 0x80) {
-                --end;
+            // Keep a multibyte UTF-8 character entirely in the next chunk.
+            if (end < doc_end) {
+                while (end > start && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+                    --end;
+                }
+                if (end == start) {
+                    throw std::runtime_error("Invalid UTF-8 at chunk boundary");
+                }
             }
-            if (end == start) {
-                throw std::runtime_error("Invalid UTF-8 at chunk boundary");
-            }
+
+            chunks.emplace_back(text.data() + start, end - start);
+            start = end;
         }
-
-        chunks.emplace_back(w.work_mem.data() + start, end - start);
-        start = end;
     }
 }
 
-void embed_chunks(const std::vector<std::string_view> &chunks, vector<float> &embeddings) {
-    embeddings.clear();
+void embed_chunks(const vector<string_view>& chunks, span<float>& embeddings) {
+    if (chunks.empty() ? !embeddings.empty()
+                       : embeddings.size() < chunks.size() || embeddings.size() % chunks.size() != 0) {
+        throw std::invalid_argument("Embedding slice must contain one row per chunk");
+    }
     if (chunks.empty()) return;
 
     httplib::Client client("http://127.0.0.1:8080");
@@ -180,13 +190,27 @@ void embed_chunks(const std::vector<std::string_view> &chunks, vector<float> &em
                                  std::to_string(response->status) + ": " + response->body);
     }
 
-    try {
-        embedding_reader reader(embeddings, chunks.size());
-        if (!nlohmann::json::sax_parse(response->body, &reader) || !reader.finish()) {
-            throw std::runtime_error("Invalid embedding response: expected one indexed, equal-sized vector per chunk");
-        }
-    } catch (...) {
-        embeddings.clear();
-        throw;
+    embedding_reader reader(embeddings, chunks.size());
+    if (!nlohmann::json::sax_parse(response->body, &reader) || !reader.finish()) {
+        throw std::runtime_error("Invalid embedding response: unexpected row count, index, or width");
     }
+}
+
+void resize_embeddings(vector<float>& embeddings, vector<size_t>& chunk_sizes, size_t embedding_dim) {
+    size_t total_chunk_count = 0;
+    for (const auto& size : chunk_sizes) {
+        total_chunk_count += size;
+    }
+    embeddings.resize(total_chunk_count * embedding_dim);
+}
+
+void create_thread_embeddings_span(vector<float> &embeddings, const vector<size_t>& chunk_sizes, size_t embedding_dim, int thread_id, span<float>& thread_embeddings) {
+    // calculate your starting and ending indices for each thread
+    // * embedding_dim accounts for embedding dimensions, since embeddings are laid out as contiguous blocks of floats per chunk.
+    size_t start_index = 0;
+    for (int i = 0; i < thread_id; ++i) {
+        start_index += chunk_sizes[i] * embedding_dim;
+    }
+    size_t end_index = start_index + chunk_sizes[thread_id] * embedding_dim;
+    thread_embeddings = span<float>(embeddings.data() + start_index, end_index - start_index);
 }

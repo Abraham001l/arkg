@@ -3,13 +3,18 @@
 #include "doc_utilities.h"
 #include "embedding_utilities.h"
 #include "graph_utilities.h"
+#include <omp.h>
 using namespace std;
-
-constexpr size_t one_GB = 1024 * 1024 * 1024;
 
 int main(int argc, char** argv) {
     // initial MPI setup
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    if (provided < MPI_THREAD_FUNNELED) {
+        std::fprintf(stderr, "MPI_THREAD_FUNNELED is unavailable\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
 
     int world_size;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -27,48 +32,62 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // creating work container for each rank
-    work_container w = {0};
-
-    // having the master rank create 1GB of shared memory to read in docs
+    docs_container local_docs{};
     if (rank == master_rank) {
-        // allocating mem to read docs into
-        auto mem = make_unique_for_overwrite<char[]>(one_GB);
-        char* base_ptr = mem.get();
+        docs_container global_docs{};
 
-        // skeleton struct for docs
-        docs_container d = {sizeof(size_t)*3, 0, 0};
-
-        // reading docs into mem
         vector<string> doc_paths;
         doc_paths.reserve(20);
         for (int i = 1; i <= 20; ++i) {
             doc_paths.push_back("test_text_files/doc" + to_string(i) + ".txt");
         }
 
-        populate_docs_container(d, base_ptr, doc_paths);
-        calc_rank_offsets(d, base_ptr, world_size);
-
-        // distributing docs to other ranks
-        distribute_docs_to_ranks(d, base_ptr, world_size, rank);
-
-        // filling work container for master rank
-        fill_work_container_for_master_rank(w, d, base_ptr, rank);
-
-        // freeing the docs container
-        free_docs_container(d);
+        populate_docs_container(global_docs, doc_paths);
+        calc_offsets(global_docs, world_size);
+        distribute_docs_to_ranks(global_docs, local_docs, world_size, rank);
     } else {
-        // receiving docs from master rank
-        receive_docs_from_master(w, master_rank);
+        receive_docs_from_master(local_docs, master_rank);
     }
 
-    // chunking the work memory into lines
-    std::vector<std::string_view> chunks;
-    chunk_memory(w, chunks);
+    const int thread_count = omp_get_num_procs();
 
-    // embedding the chunks
+    // creating embeddings vector for all threads
     vector<float> embeddings;
-    embed_chunks(chunks, embeddings);
+
+    // creating chunks global tracker for all threads
+    vector<size_t> chunk_sizes;
+
+    // starting the parallel chunking and embedding process
+    #pragma omp parallel num_threads(thread_count)
+    {
+        #pragma omp single
+        {
+            const int team_size = omp_get_num_threads();
+            calc_offsets(local_docs, team_size);
+            chunk_sizes.resize(team_size);
+        }
+
+        const int thread_id = omp_get_thread_num();
+
+        vector<string_view> chunks;
+        chunk_memory(local_docs, thread_id, chunks);
+        chunk_sizes[thread_id] = chunks.size();
+
+        // creating large embedding vector for all threads
+        #pragma omp barrier
+        #pragma omp single
+        {
+            resize_embeddings(embeddings, chunk_sizes, 384);
+        }
+        #pragma omp barrier
+
+        // getting the thread-specific span of embeddings
+        span<float> thread_embeddings;
+        create_thread_embeddings_span(embeddings, chunk_sizes, 384, thread_id, thread_embeddings);
+
+        // embedding the chunks
+        embed_chunks(chunks, thread_embeddings);
+    }
 
     // building adjacency matrix from embeddings
     matrix_rep_adjacency adj;

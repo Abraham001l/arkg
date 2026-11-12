@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <vector>
 #include <fstream>
 #include <span>
@@ -14,32 +15,22 @@ using namespace std;
 
 constexpr int size_tag = 10;
 constexpr int data_tag = 20;
+constexpr int doc_sizes_tag = 30;
+constexpr size_t one_GB = 1024 * 1024 * 1024;
 
 struct docs_container {
-    size_t doc_mem_offset;
-    size_t doc_sizes_offset;
-    size_t rank_offsets_offset;
-    span<char> doc_mem;
-    span<size_t> doc_sizes;
-    span<size_t> rank_offsets;
-};
-
-struct work_container {
-    size_t work_mem_size;
-    span<char> work_mem;
-    unique_ptr<char[]> owned_memory; // Keeps work_mem's bytes alive; frees them automatically.
+    vector<char> doc_mem;
+    vector<size_t> doc_sizes;
+    vector<size_t> worker_offsets;
 };
 
 bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank);
 
-void populate_docs_container(docs_container& d, char* data_ptr, const vector<string>& doc_paths);
+void populate_docs_container(docs_container& global_docs, const vector<string>& doc_paths);
 
-void calc_rank_offsets(docs_container& d, char* data_ptr, size_t world_size);
+void calc_offsets(docs_container& d, size_t world_size);
 
-void distribute_docs_to_ranks(docs_container& d, char* data_ptr, size_t world_size, int my_rank);
+void distribute_docs_to_ranks(const docs_container& global_docs, docs_container& local_docs,
+                              int world_size, int my_rank);
 
-void receive_docs_from_master(work_container& w, int master_rank);
-
-void fill_work_container_for_master_rank(work_container& w, docs_container& d, char* data_ptr, int my_rank);
-
-void free_docs_container(docs_container& d);
+void receive_docs_from_master(docs_container& local_docs, int master_rank);

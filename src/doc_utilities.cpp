@@ -1,4 +1,14 @@
 #include "doc_utilities.h"
+#include <array>
+
+namespace {
+int mpi_count(std::uint64_t count) {
+    if (count > static_cast<std::uint64_t>(numeric_limits<int>::max())) {
+        throw length_error("Document payload exceeds the MPI message count limit");
+    }
+    return static_cast<int>(count);
+}
+}
 
 bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank) {
     // check if the folder` exists
@@ -22,9 +32,9 @@ bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank) {
     return owner_rank != numeric_limits<int>::max();
 }
 
-void populate_docs_container(docs_container& d, char* data_ptr, const vector<string>& doc_paths) {
-    vector<size_t> temp_doc_sizes;
-    size_t cur_total_size = 0;
+void populate_docs_container(docs_container& global_docs, const vector<string>& doc_paths) {
+    global_docs.doc_mem.reserve(one_GB);
+    global_docs.doc_sizes.reserve(doc_paths.size());
 
     for (const string& path : doc_paths) {
         // opening file & reading in contents
@@ -43,30 +53,20 @@ void populate_docs_container(docs_container& d, char* data_ptr, const vector<str
         }
 
         file.seekg(0, ios::beg);
-        file.read(data_ptr + d.doc_mem_offset + cur_total_size, new_content_size);
 
-        temp_doc_sizes.push_back(new_content_size);
-        cur_total_size += new_content_size;
+        const size_t write_offset = global_docs.doc_mem.size();
+        const size_t doc_size = static_cast<size_t>(new_content_size);
+        global_docs.doc_mem.resize(write_offset + doc_size);
+        file.read(global_docs.doc_mem.data() + write_offset, new_content_size);
+        global_docs.doc_sizes.push_back(doc_size);
     }
-
-    // copying in doc_size's vector
-    d.doc_sizes_offset = d.doc_mem_offset + cur_total_size;
-    memcpy(data_ptr + d.doc_sizes_offset, temp_doc_sizes.data(), temp_doc_sizes.size() * sizeof(size_t));
-
-    // assigning spans
-    d.doc_mem = span<char>(data_ptr + d.doc_mem_offset, cur_total_size);
-    d.doc_sizes = span<size_t>(reinterpret_cast<size_t*>(data_ptr + d.doc_sizes_offset), temp_doc_sizes.size());
-
-    // copying doc_sizes_offset & doc_mem_offset into memory
-    memcpy(data_ptr + sizeof(size_t), &d.doc_sizes_offset, sizeof(size_t));
-    memcpy(data_ptr, &d.doc_mem_offset, sizeof(size_t));
 }
 
-void calc_rank_offsets(docs_container& d, char* data_ptr, size_t world_size) {
+void calc_offsets(docs_container& d, size_t world_size) {
     const size_t total_bytes = d.doc_mem.size();
     const size_t rank_count = min(world_size, d.doc_sizes.size());
-    vector<size_t> temp_rank_offsets;
-    temp_rank_offsets.reserve(world_size);
+    d.worker_offsets.clear();
+    d.worker_offsets.reserve(world_size);
 
     size_t bytes_remaining = total_bytes;
     size_t buckets_left = rank_count;
@@ -82,12 +82,12 @@ void calc_rank_offsets(docs_container& d, char* data_ptr, size_t world_size) {
         const double overshoot = size_if_added - target;
         const double undershoot = target - static_cast<double>(current_bucket_size);
 
+        // Split now if each remaining worker needs one of the remaining documents.
         if (current_bucket_size > 0 &&
             buckets_left > 1 &&
-            items_left >= buckets_left &&
-            overshoot > undershoot) {
+            (items_left == buckets_left - 1 || overshoot > undershoot)) {
                 // finalize the current bucket and move to the next one
-                temp_rank_offsets.push_back(current_doc_offset - current_bucket_size);
+                d.worker_offsets.push_back(current_doc_offset - current_bucket_size);
                 bytes_remaining -= current_bucket_size;
                 --buckets_left;
 
@@ -102,111 +102,73 @@ void calc_rank_offsets(docs_container& d, char* data_ptr, size_t world_size) {
     }
 
     // finalize the last bucket
-    if (temp_rank_offsets.size() < rank_count) {
-        temp_rank_offsets.push_back(total_bytes-current_bucket_size);
+    if (d.worker_offsets.size() < rank_count) {
+        d.worker_offsets.push_back(total_bytes - current_bucket_size);
     }
 
-    // Every rank gets an offset. Repeated end offsets represent empty work.
-    temp_rank_offsets.resize(world_size, total_bytes);
-    // assigning rank_offsets_offset
-    d.rank_offsets_offset = d.doc_sizes_offset + d.doc_sizes.size() * sizeof(size_t);
-
-    // copying in rank_offsets vector & assigning span
-    memcpy(data_ptr + d.rank_offsets_offset, temp_rank_offsets.data(), temp_rank_offsets.size() * sizeof(size_t));
-    d.rank_offsets = span<size_t>(reinterpret_cast<size_t*>(data_ptr + d.rank_offsets_offset), temp_rank_offsets.size());
-
-    // assigning rank_offsets_offset into memory
-    memcpy(data_ptr + sizeof(size_t)*2, &d.rank_offsets_offset, sizeof(size_t));
+    // every rank gets an offset. repeated end offsets represent empty work.
+    d.worker_offsets.resize(world_size, total_bytes);
 }
 
-void distribute_docs_to_ranks(docs_container& d, char* data_ptr, size_t world_size, int my_rank) {
-    // iterating through rank_offsets and sending the appropriate data to each rank
+void distribute_docs_to_ranks(const docs_container& global_docs, docs_container& local_docs,
+                              int world_size, int my_rank) {
+    size_t next_doc = 0;
     for (int rank = 0; rank < world_size; ++rank) {
+        // getting raw text byte range for this rank
+        const size_t start = global_docs.worker_offsets[rank];
+        const size_t end = rank + 1 == world_size ? global_docs.doc_mem.size() : global_docs.worker_offsets[rank + 1];
+        const auto text = span<const char>(global_docs.doc_mem).subspan(start, end - start);
+
+        // looping through doc_sizes to find range
+        const size_t first_doc = next_doc;
+        size_t remaining = text.size();
+        while (remaining != 0) {
+            remaining -= global_docs.doc_sizes[next_doc++];
+        }
+        const auto sizes = span<const size_t>(global_docs.doc_sizes).subspan(first_doc, next_doc - first_doc);
+
+        // Copy the master's shard into its local vectors so it can release global_docs.
         if (rank == my_rank) {
-            // this rank already has the data, no need to send
+            local_docs.doc_mem.assign(text.begin(), text.end());
+            local_docs.doc_sizes.assign(sizes.begin(), sizes.end());
+            local_docs.worker_offsets.clear();
             continue;
         }
-        
-        // calculating the start and end offsets for the current rank
-        size_t start_offset = d.rank_offsets[rank];
-        size_t end_offset = (rank == d.rank_offsets.size() - 1) ? d.doc_sizes_offset - d.doc_mem_offset : d.rank_offsets[rank + 1];
-        size_t data_size = end_offset - start_offset;
 
-        // sending the data in two parts: first the size, then the actual data
-        MPI_Send(
-            &data_size, 
-            1, 
-            MPI_UINT64_T, 
-            rank, 
-            size_tag, 
-            MPI_COMM_WORLD);
+        // an empty rank only receives the header
+        // header contains byte count for raw text and doc count for sizes array
+        const std::array<std::uint64_t, 2> header{text.size(), sizes.size()};
+        const int byte_count = mpi_count(header[0]);
+        const int doc_count = mpi_count(header[1]);
+        MPI_Send(header.data(), 2, MPI_UINT64_T, rank, size_tag, MPI_COMM_WORLD);
+        if (byte_count == 0) continue;
 
-        // The size message is sufficient for ranks with no assigned bytes.
-        if (data_size == 0) continue;
-
-        MPI_Send(
-            data_ptr + d.doc_mem_offset + start_offset, 
-            data_size, 
-            MPI_CHAR, 
-            rank, 
-            data_tag, 
-            MPI_COMM_WORLD);
+        // send the sizes array and the raw text to the rank
+        const vector<std::uint64_t> wire_sizes(sizes.begin(), sizes.end());
+        MPI_Send(wire_sizes.data(), doc_count, MPI_UINT64_T, rank, doc_sizes_tag, MPI_COMM_WORLD);
+        MPI_Send(text.data(), byte_count, MPI_CHAR, rank, data_tag, MPI_COMM_WORLD);
     }
 }
 
-void receive_docs_from_master(work_container& w, int master_rank) {
-    // receiving the data from the master rank
-    MPI_Recv(
-        &w.work_mem_size, 
-        1, 
-        MPI_UINT64_T, 
-        master_rank, 
-        size_tag, 
-        MPI_COMM_WORLD, 
-        MPI_STATUS_IGNORE);
+void receive_docs_from_master(docs_container& local_docs, int master_rank) {
+    // get header
+    std::array<std::uint64_t, 2> header{};
+    MPI_Recv(header.data(), 2, MPI_UINT64_T, master_rank, size_tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    const int byte_count = mpi_count(header[0]);
+    const int doc_count = mpi_count(header[1]);
 
-    if (w.work_mem_size == 0) {
-        w.work_mem = span<char>();
-        w.owned_memory.reset();
+    local_docs.doc_mem.resize(byte_count);
+    local_docs.worker_offsets.clear();
+    if (byte_count == 0) {
+        local_docs.doc_sizes.clear();
         return;
     }
 
-    w.owned_memory = make_unique_for_overwrite<char[]>(w.work_mem_size);
-    w.work_mem = span<char>(w.owned_memory.get(), w.work_mem_size);
-    MPI_Recv(
-        w.work_mem.data(), 
-        w.work_mem_size, 
-        MPI_CHAR, 
-        master_rank, 
-        data_tag, 
-        MPI_COMM_WORLD, 
-        MPI_STATUS_IGNORE);
-}
+    vector<std::uint64_t> wire_sizes(doc_count);
+    MPI_Recv(wire_sizes.data(), doc_count, MPI_UINT64_T, master_rank, doc_sizes_tag,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    local_docs.doc_sizes.assign(wire_sizes.begin(), wire_sizes.end());
 
-void fill_work_container_for_master_rank(work_container& w, docs_container& d, char* data_ptr, int my_rank) {
-    // calculating the total size of the work memory
-    size_t start_offset = d.rank_offsets[my_rank];
-    size_t end_offset = (my_rank == d.rank_offsets.size() - 1) ? d.doc_sizes_offset - d.doc_mem_offset : d.rank_offsets[my_rank + 1];
-    size_t total_size = end_offset - start_offset;
-    w.work_mem_size = total_size;
-
-    if (total_size == 0) {
-        w.work_mem = span<char>();
-        w.owned_memory.reset();
-        return;
-    }
-
-    // allocating memory for the work memory
-    w.owned_memory = make_unique_for_overwrite<char[]>(total_size);
-    w.work_mem = span<char>(w.owned_memory.get(), total_size);
-
-    // copying the relevant portion of the doc memory into the work memory
-    memcpy(w.work_mem.data(), data_ptr + d.doc_mem_offset + start_offset, total_size);
-}
-
-void free_docs_container(docs_container& d) {
-    // These spans do not own memory; main's unique_ptr frees the backing buffer.
-    d.doc_mem = span<char>();
-    d.doc_sizes = span<size_t>();
-    d.rank_offsets = span<size_t>();
+    MPI_Recv(local_docs.doc_mem.data(), byte_count, MPI_CHAR, master_rank, data_tag,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
