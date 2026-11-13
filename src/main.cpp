@@ -37,10 +37,7 @@ int main(int argc, char** argv) {
         docs_container global_docs{};
 
         vector<string> doc_paths;
-        doc_paths.reserve(20);
-        for (int i = 1; i <= 20; ++i) {
-            doc_paths.push_back("test_text_files/doc" + to_string(i) + ".txt");
-        }
+        crawl_dir("test_text_files", doc_paths);
 
         populate_docs_container(global_docs, doc_paths);
         calc_offsets(global_docs, world_size);

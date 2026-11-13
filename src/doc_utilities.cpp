@@ -1,5 +1,7 @@
 #include "doc_utilities.h"
 #include <array>
+#include <cstdio>
+#include <unordered_map>
 
 namespace {
 int mpi_count(std::uint64_t count) {
@@ -7,6 +9,72 @@ int mpi_count(std::uint64_t count) {
         throw length_error("Document payload exceeds the MPI message count limit");
     }
     return static_cast<int>(count);
+}
+
+void read_text_file(const string& path, docs_container& global_docs) {
+    ifstream file(path, ios::binary | ios::ate);
+    if (!file.is_open()) {
+        printf("Error opening file: %s\n", path.c_str());
+        return;
+    }
+
+    const streamsize file_size = file.tellg();
+    if (file_size <= 0) {
+        printf("Error reading file: %s\n", path.c_str());
+        return;
+    }
+
+    auto& doc_mem = global_docs.doc_mem;
+    const size_t write_offset = doc_mem.size();
+    if (static_cast<std::uintmax_t>(file_size) > doc_mem.max_size() - write_offset) {
+        throw length_error("Document buffer is too large");
+    }
+    const size_t doc_size = static_cast<size_t>(file_size);
+    file.seekg(0, ios::beg);
+    doc_mem.resize(write_offset + doc_size);
+    if (!file.read(doc_mem.data() + write_offset, file_size)) {
+        doc_mem.resize(write_offset);
+        printf("Error reading file: %s\n", path.c_str());
+        return;
+    }
+    global_docs.doc_sizes.push_back(doc_size);
+}
+
+void read_pdf_file(const string& path, docs_container& global_docs) {
+    // Quote the absolute path as one shell argument, including any apostrophes.
+    string command = "pdftotext -enc UTF-8 -nopgbrk '";
+    for (char ch : filesystem::absolute(path).string()) {
+        if (ch == '\'') {
+            command += "'\\''";
+        } else {
+            command += ch;
+        }
+    }
+    command += "' -";
+
+    const auto close_pipe = [](FILE* stream) { pclose(stream); };
+    unique_ptr<FILE, decltype(close_pipe)> pipe(popen(command.c_str(), "r"), close_pipe);
+    if (!pipe) {
+        fprintf(stderr, "Error starting pdftotext for %s\n", path.c_str());
+        return;
+    }
+
+    string text;
+    array<char, 4096> buffer;
+    while (const size_t count = fread(buffer.data(), 1, buffer.size(), pipe.get())) {
+        text.append(buffer.data(), count);
+    }
+    const bool read_failed = ferror(pipe.get()) != 0;
+    const int status = pclose(pipe.release());
+    if (read_failed || status != 0) {
+        fprintf(stderr, "Error extracting PDF text: %s\n", path.c_str());
+        return;
+    }
+
+    if (text.find_first_not_of(" \t\r\n\f\v") != string::npos) {
+        global_docs.doc_mem.insert(global_docs.doc_mem.end(), text.begin(), text.end());
+        global_docs.doc_sizes.push_back(text.size());
+    }
 }
 }
 
@@ -33,32 +101,20 @@ bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank) {
 }
 
 void populate_docs_container(docs_container& global_docs, const vector<string>& doc_paths) {
+    using FileReader = void (*)(const string&, docs_container&);
+    static const unordered_map<string, FileReader> readers{
+        {".txt", read_text_file},
+        {".pdf", read_pdf_file},
+    };
+
     global_docs.doc_mem.reserve(one_GB);
     global_docs.doc_sizes.reserve(doc_paths.size());
 
     for (const string& path : doc_paths) {
-        // opening file & reading in contents
-        ifstream file(path, ios::binary | ios::ate);
-
-        if (!file.is_open()) {
-            printf("Error opening file: %s\n", path.c_str());
-            continue;
+        const auto reader = readers.find(filesystem::path(path).extension().string());
+        if (reader != readers.end()) {
+            reader->second(path, global_docs);
         }
-
-        streamsize new_content_size = file.tellg();
-
-        if (new_content_size <= 0) {
-            printf("Error reading file: %s\n", path.c_str());
-            continue;
-        }
-
-        file.seekg(0, ios::beg);
-
-        const size_t write_offset = global_docs.doc_mem.size();
-        const size_t doc_size = static_cast<size_t>(new_content_size);
-        global_docs.doc_mem.resize(write_offset + doc_size);
-        file.read(global_docs.doc_mem.data() + write_offset, new_content_size);
-        global_docs.doc_sizes.push_back(doc_size);
     }
 }
 
@@ -171,4 +227,14 @@ void receive_docs_from_master(docs_container& local_docs, int master_rank) {
 
     MPI_Recv(local_docs.doc_mem.data(), byte_count, MPI_CHAR, master_rank, data_tag,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+void crawl_dir(string path, vector<string>& doc_paths) {
+    doc_paths.clear();
+    for (const auto& entry : filesystem::recursive_directory_iterator(path)) {
+        if (filesystem::is_regular_file(entry.symlink_status())) {
+            doc_paths.push_back(entry.path().string());
+        }
+    }
+    sort(doc_paths.begin(), doc_paths.end());
 }

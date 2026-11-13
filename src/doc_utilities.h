@@ -26,6 +26,8 @@ struct docs_container {
 
 bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank);
 
+void crawl_dir(string path, vector<string>& doc_paths);
+
 void populate_docs_container(docs_container& global_docs, const vector<string>& doc_paths);
 
 void calc_offsets(docs_container& d, size_t world_size);
