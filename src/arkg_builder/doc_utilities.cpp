@@ -109,11 +109,22 @@ void populate_docs_container(docs_container& global_docs, const vector<string>& 
 
     global_docs.doc_mem.reserve(one_GB);
     global_docs.doc_sizes.reserve(doc_paths.size());
+    global_docs.doc_paths.reserve(doc_paths.size());
+
+    array<char, MPI_MAX_PROCESSOR_NAME> processor_name{};
+    int name_length;
+    MPI_Get_processor_name(processor_name.data(), &name_length);
+    const string source_prefix = string(processor_name.data(), name_length) + ':';
 
     for (const string& path : doc_paths) {
         const auto reader = readers.find(filesystem::path(path).extension().string());
         if (reader != readers.end()) {
+            string source_path = source_prefix + filesystem::absolute(path).string();
+            const size_t doc_count = global_docs.doc_sizes.size();
             reader->second(path, global_docs);
+            if (global_docs.doc_sizes.size() != doc_count) {
+                global_docs.doc_paths.push_back(std::move(source_path));
+            }
         }
     }
 }

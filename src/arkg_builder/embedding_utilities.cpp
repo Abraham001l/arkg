@@ -170,7 +170,7 @@ void embed_chunks(const vector<string_view>& chunks, span<float>& embeddings) {
 
     httplib::Client client("http://127.0.0.1:8080");
     client.set_connection_timeout(5, 0);
-    client.set_read_timeout(120, 0);
+    client.set_read_timeout(6000, 0);
 
     std::string request;
     {

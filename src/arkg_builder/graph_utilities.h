@@ -21,3 +21,5 @@ void build_csr(csr_graph &csr, const matrix_rep_adjacency &adj);
 void norm(vector<float> &embeddings, vector<float> &norms);
 
 void matrix_mul(vector<float> &embeddings, vector<float> &result, size_t d);
+
+// void save_graph(const csr_graph &csr, const vector<float> &embeddings,  const string &filename);`

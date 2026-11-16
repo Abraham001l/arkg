@@ -6,24 +6,24 @@ find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(BLAS REQUIRED)
 
-add_executable(fast_rag
-    src/main.cpp
-    src/doc_utilities.cpp
-    src/embedding_utilities.cpp
-    src/graph_utilities.cpp
+add_executable(arkg_builder
+    src/arkg_builder/main.cpp
+    src/arkg_builder/doc_utilities.cpp
+    src/arkg_builder/embedding_utilities.cpp
+    src/arkg_builder/graph_utilities.cpp
 )
 
-target_link_libraries(fast_rag PRIVATE ${BLAS_LIBRARIES})
+target_link_libraries(arkg_builder PRIVATE ${BLAS_LIBRARIES})
 
-target_include_directories(fast_rag PRIVATE
+target_include_directories(arkg_builder PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 find_package(Threads REQUIRED)
-target_link_libraries(fast_rag PRIVATE Threads::Threads)
+target_link_libraries(arkg_builder PRIVATE Threads::Threads)
 
-target_compile_features(fast_rag PRIVATE cxx_std_20)
-set_target_properties(fast_rag PROPERTIES
+target_compile_features(arkg_builder PRIVATE cxx_std_20)
+set_target_properties(arkg_builder PROPERTIES
     CXX_EXTENSIONS OFF
 )
-target_link_libraries(fast_rag PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_link_libraries(arkg_builder PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)

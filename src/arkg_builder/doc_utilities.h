@@ -10,6 +10,7 @@
 #include <system_error>
 #include <limits>
 #include <memory>
+#include <string>
 #include "mpi.h"
 using namespace std;
 
@@ -22,6 +23,7 @@ struct docs_container {
     vector<char> doc_mem;
     vector<size_t> doc_sizes;
     vector<size_t> worker_offsets;
+    vector<string> doc_paths;
 };
 
 bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank);
