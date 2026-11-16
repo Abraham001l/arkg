@@ -4,6 +4,7 @@
 #include "embedding_utilities.h"
 #include "graph_utilities.h"
 #include <omp.h>
+#include <httplib.h>
 using namespace std;
 
 int main(int argc, char** argv) {
@@ -22,28 +23,28 @@ int main(int argc, char** argv) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    // picking master rank for doc retrieval
-    int master_rank;
-    bool doc_retriever_found = pick_doc_retriever("test_text_files", rank, master_rank);
-
-    if (!doc_retriever_found) {
-        printf("No doc retriever found.\n");
+    // checking if recieved all arguements
+    if (argc != 3) {
+        if (rank == 0) {
+            std::fprintf(stderr, "Usage: %s <file_host_url> <directory>\n", argv[0]);
+        }
         MPI_Finalize();
         return 1;
     }
 
     docs_container local_docs{};
-    if (rank == master_rank) {
+    if (rank == 0) {
+        httplib::Client client(argv[1]);
         docs_container global_docs{};
 
         vector<string> doc_paths;
-        crawl_dir("test_text_files", doc_paths);
+        crawl_dir(client, argv[2], doc_paths);
 
-        populate_docs_container(global_docs, doc_paths);
+        populate_docs_container(client, global_docs, doc_paths);
         calc_offsets(global_docs, world_size);
         distribute_docs_to_ranks(global_docs, local_docs, world_size, rank);
     } else {
-        receive_docs_from_master(local_docs, master_rank);
+        receive_docs_from_master(local_docs, 0);
     }
 
     const int thread_count = omp_get_num_procs();

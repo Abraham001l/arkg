@@ -1,7 +1,11 @@
 #include "doc_utilities.h"
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <nlohmann/json.hpp>
+#include <string_view>
 #include <unordered_map>
+#include <unistd.h>
 
 namespace {
 int mpi_count(std::uint64_t count) {
@@ -11,51 +15,44 @@ int mpi_count(std::uint64_t count) {
     return static_cast<int>(count);
 }
 
-void read_text_file(const string& path, docs_container& global_docs) {
-    ifstream file(path, ios::binary | ios::ate);
-    if (!file.is_open()) {
-        printf("Error opening file: %s\n", path.c_str());
-        return;
-    }
+void read_text_file(string_view bytes, docs_container& global_docs) {
+    if (bytes.empty()) return;
 
-    const streamsize file_size = file.tellg();
-    if (file_size <= 0) {
-        printf("Error reading file: %s\n", path.c_str());
-        return;
-    }
-
-    auto& doc_mem = global_docs.doc_mem;
-    const size_t write_offset = doc_mem.size();
-    if (static_cast<std::uintmax_t>(file_size) > doc_mem.max_size() - write_offset) {
-        throw length_error("Document buffer is too large");
-    }
-    const size_t doc_size = static_cast<size_t>(file_size);
-    file.seekg(0, ios::beg);
-    doc_mem.resize(write_offset + doc_size);
-    if (!file.read(doc_mem.data() + write_offset, file_size)) {
-        doc_mem.resize(write_offset);
-        printf("Error reading file: %s\n", path.c_str());
-        return;
-    }
-    global_docs.doc_sizes.push_back(doc_size);
+    global_docs.doc_mem.insert(global_docs.doc_mem.end(), bytes.begin(), bytes.end());
+    global_docs.doc_sizes.push_back(bytes.size());
 }
 
-void read_pdf_file(const string& path, docs_container& global_docs) {
-    // Quote the absolute path as one shell argument, including any apostrophes.
-    string command = "pdftotext -enc UTF-8 -nopgbrk '";
-    for (char ch : filesystem::absolute(path).string()) {
-        if (ch == '\'') {
-            command += "'\\''";
-        } else {
-            command += ch;
-        }
-    }
-    command += "' -";
+void read_pdf_file(string_view bytes, docs_container& global_docs) {
+    if (bytes.empty()) return;
 
+    // pdftotext opens a local copy of the downloaded bytes.
+    char path[] = "/tmp/arkg-pdf-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd == -1) {
+        perror("Error creating temporary PDF");
+        return;
+    }
+    const auto remove_file = [](const char* name) { unlink(name); };
+    const unique_ptr<char, decltype(remove_file)> temporary_file(path, remove_file);
+
+    FILE* file = fdopen(fd, "wb");
+    if (!file) {
+        close(fd);
+        fprintf(stderr, "Error opening temporary PDF\n");
+        return;
+    }
+    const size_t written = fwrite(bytes.data(), 1, bytes.size(), file);
+    const int close_status = fclose(file);
+    if (written != bytes.size() || close_status != 0) {
+        fprintf(stderr, "Error writing temporary PDF\n");
+        return;
+    }
+
+    const string command = string("pdftotext -enc UTF-8 -nopgbrk ") + path + " -";
     const auto close_pipe = [](FILE* stream) { pclose(stream); };
     unique_ptr<FILE, decltype(close_pipe)> pipe(popen(command.c_str(), "r"), close_pipe);
     if (!pipe) {
-        fprintf(stderr, "Error starting pdftotext for %s\n", path.c_str());
+        fprintf(stderr, "Error starting pdftotext\n");
         return;
     }
 
@@ -67,13 +64,12 @@ void read_pdf_file(const string& path, docs_container& global_docs) {
     const bool read_failed = ferror(pipe.get()) != 0;
     const int status = pclose(pipe.release());
     if (read_failed || status != 0) {
-        fprintf(stderr, "Error extracting PDF text: %s\n", path.c_str());
+        fprintf(stderr, "Error extracting PDF text\n");
         return;
     }
 
     if (text.find_first_not_of(" \t\r\n\f\v") != string::npos) {
-        global_docs.doc_mem.insert(global_docs.doc_mem.end(), text.begin(), text.end());
-        global_docs.doc_sizes.push_back(text.size());
+        read_text_file(text, global_docs);
     }
 }
 }
@@ -100,9 +96,10 @@ bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank) {
     return owner_rank != numeric_limits<int>::max();
 }
 
-void populate_docs_container(docs_container& global_docs, const vector<string>& doc_paths) {
-    using FileReader = void (*)(const string&, docs_container&);
-    static const unordered_map<string, FileReader> readers{
+void populate_docs_container(httplib::Client& client, docs_container& global_docs,
+                             const vector<string>& doc_paths) {
+    using FileParser = void (*)(string_view, docs_container&);
+    static const unordered_map<string, FileParser> readers{
         {".txt", read_text_file},
         {".pdf", read_pdf_file},
     };
@@ -111,20 +108,26 @@ void populate_docs_container(docs_container& global_docs, const vector<string>& 
     global_docs.doc_sizes.reserve(doc_paths.size());
     global_docs.doc_paths.reserve(doc_paths.size());
 
-    array<char, MPI_MAX_PROCESSOR_NAME> processor_name{};
-    int name_length;
-    MPI_Get_processor_name(processor_name.data(), &name_length);
-    const string source_prefix = string(processor_name.data(), name_length) + ':';
-
     for (const string& path : doc_paths) {
+        // find appropiate reader for the file extension
         const auto reader = readers.find(filesystem::path(path).extension().string());
-        if (reader != readers.end()) {
-            string source_path = source_prefix + filesystem::absolute(path).string();
-            const size_t doc_count = global_docs.doc_sizes.size();
-            reader->second(path, global_docs);
-            if (global_docs.doc_sizes.size() != doc_count) {
-                global_docs.doc_paths.push_back(std::move(source_path));
-            }
+        if (reader == readers.end()) continue;
+
+        // download the file from the server
+        const httplib::Params params{{"path", path}};
+        const auto response = client.Get("/get_file", params);
+        if (!response || response->status != 200) {
+            const string error = response ? "HTTP " + to_string(response->status)
+                                          : httplib::to_string(response.error());
+            fprintf(stderr, "Failed to download %s: %s\n", path.c_str(), error.c_str());
+            continue;
+        }
+
+        // read the file into the global_docs container
+        const size_t doc_count = global_docs.doc_sizes.size();
+        reader->second(response->body, global_docs);
+        if (global_docs.doc_sizes.size() != doc_count) {
+            global_docs.doc_paths.push_back(path);
         }
     }
 }
@@ -240,12 +243,13 @@ void receive_docs_from_master(docs_container& local_docs, int master_rank) {
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 }
 
-void crawl_dir(string path, vector<string>& doc_paths) {
-    doc_paths.clear();
-    for (const auto& entry : filesystem::recursive_directory_iterator(path)) {
-        if (filesystem::is_regular_file(entry.symlink_status())) {
-            doc_paths.push_back(entry.path().string());
-        }
+void crawl_dir(httplib::Client& client, const string& path, vector<string>& doc_paths) {
+    const httplib::Params params{{"path", path}};
+    const auto res = client.Get("/crawl_dir", params);
+
+    if (!res || res->status != 200) {
+        throw runtime_error("Failed to crawl directory: " + path);
     }
-    sort(doc_paths.begin(), doc_paths.end());
+
+    doc_paths = nlohmann::json::parse(res->body).get<vector<string>>();
 }

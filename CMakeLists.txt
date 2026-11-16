@@ -27,3 +27,13 @@ set_target_properties(arkg_builder PROPERTIES
     CXX_EXTENSIONS OFF
 )
 target_link_libraries(arkg_builder PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
+
+add_executable(file_host
+    src/file_host/main.cpp
+    src/file_host/endpoints.cpp
+)
+
+target_include_directories(file_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(file_host PRIVATE Threads::Threads)
+target_compile_features(file_host PRIVATE cxx_std_20)
+set_target_properties(file_host PROPERTIES CXX_EXTENSIONS OFF)
