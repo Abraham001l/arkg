@@ -18,6 +18,7 @@ using namespace std;
 constexpr int size_tag = 10;
 constexpr int data_tag = 20;
 constexpr int doc_sizes_tag = 30;
+constexpr int doc_paths_tag = 40;
 constexpr size_t one_GB = 1024 * 1024 * 1024;
 
 struct docs_container {
@@ -29,7 +30,7 @@ struct docs_container {
 
 bool pick_doc_retriever(const string& doc_path, int my_rank, int& master_rank);
 
-void crawl_dir(httplib::Client& client, const string& path, vector<string>& doc_paths);
+void crawl_dir(httplib::Client& client, vector<string>& doc_paths);
 
 void populate_docs_container(httplib::Client& client, docs_container& global_docs,
                              const vector<string>& doc_paths);

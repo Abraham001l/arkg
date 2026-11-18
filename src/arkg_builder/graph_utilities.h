@@ -1,6 +1,8 @@
 #pragma once
 #include <cstddef>
+#include <string>
 #include <vector>
+#include "doc_utilities.h"
 using namespace std;
 constexpr int D = 384;
 
@@ -22,4 +24,8 @@ void norm(vector<float> &embeddings, vector<float> &norms);
 
 void matrix_mul(vector<float> &embeddings, vector<float> &result, size_t d);
 
-// void save_graph(const csr_graph &csr, const vector<float> &embeddings,  const string &filename);`
+// Collective over MPI_COMM_WORLD. Returns the build ID after every shard is saved.
+string save_graph(const csr_graph& csr, const vector<float>& embeddings,
+                  const docs_container& docs, const vector<size_t>& doc_indices,
+                  const vector<size_t>& chunk_byte_offsets, const vector<size_t>& chunk_byte_lengths,
+                  const string& file_host_url, float threshold);

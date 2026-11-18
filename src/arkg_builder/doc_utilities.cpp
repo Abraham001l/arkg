@@ -196,41 +196,48 @@ void distribute_docs_to_ranks(const docs_container& global_docs, docs_container&
             remaining -= global_docs.doc_sizes[next_doc++];
         }
         const auto sizes = span<const size_t>(global_docs.doc_sizes).subspan(first_doc, next_doc - first_doc);
+        const auto paths = span<const string>(global_docs.doc_paths).subspan(first_doc, sizes.size());
 
         // Copy the master's shard into its local vectors so it can release global_docs.
         if (rank == my_rank) {
             local_docs.doc_mem.assign(text.begin(), text.end());
             local_docs.doc_sizes.assign(sizes.begin(), sizes.end());
+            local_docs.doc_paths.assign(paths.begin(), paths.end());
             local_docs.worker_offsets.clear();
             continue;
         }
 
         // an empty rank only receives the header
-        // header contains byte count for raw text and doc count for sizes array
-        const std::array<std::uint64_t, 2> header{text.size(), sizes.size()};
+        // Header contains text bytes, document count, and serialized path bytes.
+        const string wire_paths = paths.empty() ? string{} : nlohmann::json(paths).dump();
+        const std::array<std::uint64_t, 3> header{text.size(), sizes.size(), wire_paths.size()};
         const int byte_count = mpi_count(header[0]);
         const int doc_count = mpi_count(header[1]);
-        MPI_Send(header.data(), 2, MPI_UINT64_T, rank, size_tag, MPI_COMM_WORLD);
+        const int path_byte_count = mpi_count(header[2]);
+        MPI_Send(header.data(), header.size(), MPI_UINT64_T, rank, size_tag, MPI_COMM_WORLD);
         if (byte_count == 0) continue;
 
-        // send the sizes array and the raw text to the rank
+        // Send the sizes, raw text, and paths to the rank.
         const vector<std::uint64_t> wire_sizes(sizes.begin(), sizes.end());
         MPI_Send(wire_sizes.data(), doc_count, MPI_UINT64_T, rank, doc_sizes_tag, MPI_COMM_WORLD);
         MPI_Send(text.data(), byte_count, MPI_CHAR, rank, data_tag, MPI_COMM_WORLD);
+        MPI_Send(wire_paths.data(), path_byte_count, MPI_CHAR, rank, doc_paths_tag, MPI_COMM_WORLD);
     }
 }
 
 void receive_docs_from_master(docs_container& local_docs, int master_rank) {
     // get header
-    std::array<std::uint64_t, 2> header{};
-    MPI_Recv(header.data(), 2, MPI_UINT64_T, master_rank, size_tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    std::array<std::uint64_t, 3> header{};
+    MPI_Recv(header.data(), header.size(), MPI_UINT64_T, master_rank, size_tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     const int byte_count = mpi_count(header[0]);
     const int doc_count = mpi_count(header[1]);
+    const int path_byte_count = mpi_count(header[2]);
 
     local_docs.doc_mem.resize(byte_count);
     local_docs.worker_offsets.clear();
     if (byte_count == 0) {
         local_docs.doc_sizes.clear();
+        local_docs.doc_paths.clear();
         return;
     }
 
@@ -241,14 +248,19 @@ void receive_docs_from_master(docs_container& local_docs, int master_rank) {
 
     MPI_Recv(local_docs.doc_mem.data(), byte_count, MPI_CHAR, master_rank, data_tag,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    string wire_paths(path_byte_count, '\0');
+    MPI_Recv(wire_paths.data(), path_byte_count, MPI_CHAR, master_rank, doc_paths_tag,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    local_docs.doc_paths = nlohmann::json::parse(wire_paths).get<vector<string>>();
 }
 
-void crawl_dir(httplib::Client& client, const string& path, vector<string>& doc_paths) {
-    const httplib::Params params{{"path", path}};
+void crawl_dir(httplib::Client& client, vector<string>& doc_paths) {
+    const httplib::Params params{{"exclude", ".arkg-graphs"}};
     const auto res = client.Get("/crawl_dir", params);
 
     if (!res || res->status != 200) {
-        throw runtime_error("Failed to crawl directory: " + path);
+        throw runtime_error("Failed to crawl the file host's root directory");
     }
 
     doc_paths = nlohmann::json::parse(res->body).get<vector<string>>();

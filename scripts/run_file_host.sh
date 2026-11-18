@@ -3,4 +3,4 @@ set -e
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-exec ./build/file_host
+exec ./build/file_host "$@"

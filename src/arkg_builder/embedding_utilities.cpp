@@ -123,8 +123,13 @@ public:
 };
 }
 
-void chunk_memory(const docs_container& local_docs, const int thread_id, vector<string_view>& chunks) {
+void chunk_memory(const docs_container& local_docs, const int thread_id,
+                  vector<string_view>& chunks, vector<size_t>& local_doc_indices,
+                  vector<size_t>& local_chunk_byte_offsets, vector<size_t>& local_chunk_byte_lengths) {
     chunks.clear();
+    local_doc_indices.clear();
+    local_chunk_byte_offsets.clear();
+    local_chunk_byte_lengths.clear();
     constexpr size_t max_chunk_bytes = 512;
     const auto& text = local_docs.doc_mem;
     const auto& offsets = local_docs.worker_offsets;
@@ -141,7 +146,8 @@ void chunk_memory(const docs_container& local_docs, const int thread_id, vector<
     }
 
     while (start < worker_end) {
-        const size_t doc_end = start + local_docs.doc_sizes[doc_index++];
+        const size_t doc_start = start;
+        const size_t doc_end = start + local_docs.doc_sizes[doc_index];
         while (start < doc_end) {
             size_t end = start + std::min(max_chunk_bytes, doc_end - start);
 
@@ -156,8 +162,12 @@ void chunk_memory(const docs_container& local_docs, const int thread_id, vector<
             }
 
             chunks.emplace_back(text.data() + start, end - start);
+            local_doc_indices.push_back(doc_index);
+            local_chunk_byte_offsets.push_back(start - doc_start);
+            local_chunk_byte_lengths.push_back(end - start);
             start = end;
         }
+        ++doc_index;
     }
 }
 
@@ -213,4 +223,58 @@ void create_thread_embeddings_span(vector<float> &embeddings, const vector<size_
     }
     size_t end_index = start_index + chunk_sizes[thread_id] * embedding_dim;
     thread_embeddings = span<float>(embeddings.data() + start_index, end_index - start_index);
+}
+
+void resize_doc_indices(vector<size_t>& doc_indices, const vector<size_t>& chunk_sizes) {
+    size_t total_chunk_count = 0;
+    for (const auto& size : chunk_sizes) {
+        total_chunk_count += size;
+    }
+    doc_indices.resize(total_chunk_count);
+}
+
+void copy_local_doc_indices_to_global(vector<size_t>& doc_indices, const vector<size_t>& local_doc_indices, const vector<size_t>& chunk_sizes, int thread_id) {
+    // calculate your starting index for each thread
+    size_t start_index = 0;
+    for (int i = 0; i < thread_id; ++i) {
+        start_index += chunk_sizes[i];
+    }
+    // copy the local doc indices to the global doc indices at the calculated position
+    std::copy(local_doc_indices.begin(), local_doc_indices.end(), doc_indices.begin() + start_index);
+}
+
+void resize_chunk_byte_offsets(vector<size_t>& chunk_byte_offsets, const vector<size_t>& chunk_sizes) {
+    size_t total_chunk_count = 0;
+    for (const auto& size : chunk_sizes) {
+        total_chunk_count += size;
+    }
+    chunk_byte_offsets.resize(total_chunk_count);
+}
+
+void resize_chunk_byte_lengths(vector<size_t>& chunk_byte_lengths, const vector<size_t>& chunk_sizes) {
+    size_t total_chunk_count = 0;
+    for (const auto& size : chunk_sizes) {
+        total_chunk_count += size;
+    }
+    chunk_byte_lengths.resize(total_chunk_count);
+}
+
+void copy_local_chunk_byte_offsets_to_global(vector<size_t>& chunk_byte_offsets,
+    const vector<size_t>& local_chunk_byte_offsets, const vector<size_t>& chunk_sizes, int thread_id) {
+    size_t start_index = 0;
+    for (int i = 0; i < thread_id; ++i) {
+        start_index += chunk_sizes[i];
+    }
+    std::copy(local_chunk_byte_offsets.begin(), local_chunk_byte_offsets.end(),
+              chunk_byte_offsets.begin() + start_index);
+}
+
+void copy_local_chunk_byte_lengths_to_global(vector<size_t>& chunk_byte_lengths,
+    const vector<size_t>& local_chunk_byte_lengths, const vector<size_t>& chunk_sizes, int thread_id) {
+    size_t start_index = 0;
+    for (int i = 0; i < thread_id; ++i) {
+        start_index += chunk_sizes[i];
+    }
+    std::copy(local_chunk_byte_lengths.begin(), local_chunk_byte_lengths.end(),
+              chunk_byte_lengths.begin() + start_index);
 }
