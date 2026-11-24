@@ -37,3 +37,13 @@ target_include_directories(file_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_p
 target_link_libraries(file_host PRIVATE Threads::Threads)
 target_compile_features(file_host PRIVATE cxx_std_20)
 set_target_properties(file_host PROPERTIES CXX_EXTENSIONS OFF)
+
+add_executable(arkg_host
+    src/arkg_host/main.cpp
+    src/arkg_host/query_utilities.cpp
+)
+
+target_include_directories(arkg_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_link_libraries(arkg_host PRIVATE Threads::Threads MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_compile_features(arkg_host PRIVATE cxx_std_20)
+set_target_properties(arkg_host PROPERTIES CXX_EXTENSIONS OFF)

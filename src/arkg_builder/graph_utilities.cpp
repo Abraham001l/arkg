@@ -113,12 +113,12 @@ void matrix_mul(vector<float> &embeddings, vector<float> &result, size_t d) {
 string save_graph(const csr_graph& csr, const vector<float>& embeddings,
                   const docs_container& docs, const vector<size_t>& doc_indices,
                   const vector<size_t>& chunk_byte_offsets, const vector<size_t>& chunk_byte_lengths,
-                  const string& file_host_url, float threshold) {
+                  const string& graph_host_url, float threshold) {
     static_assert(sizeof(float) == 4 && numeric_limits<float>::is_iec559);
     int rank, rank_count;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &rank_count);
-    httplib::Client client(file_host_url);
+    httplib::Client client(graph_host_url);
 
     // Every rank reaches the same checkpoint, including when one upload fails.
     string error;
@@ -169,7 +169,7 @@ string save_graph(const csr_graph& csr, const vector<float>& embeddings,
     string build_id;
     if (rank == 0) {
         try {
-            const nlohmann::json options{{"path", ".arkg-graphs/build"}, {"unique", true}};
+            const nlohmann::json options{{"path", "build"}, {"unique", true}};
             const auto response = client.Post("/create_directory", options.dump(), "application/json");
             require_success(response);
             const auto path = nlohmann::json::parse(response->body).at("path").get<string>();
@@ -185,7 +185,7 @@ string save_graph(const csr_graph& csr, const vector<float>& embeddings,
     MPI_Bcast(build_id.data(), id_length, MPI_CHAR, 0, MPI_COMM_WORLD);
 
     const string shard_id = "shard-" + to_string(rank);
-    const string build_path = ".arkg-graphs/" + build_id;
+    const string build_path = build_id;
     const string shard_path = build_path + "/shards/" + shard_id;
     const auto upload = [&](const string& file, const string& bytes) {
         const auto endpoint = httplib::append_query_params("/save_file", {{"path", file}});
@@ -238,7 +238,7 @@ string save_graph(const csr_graph& csr, const vector<float>& embeddings,
                 {"similarity", "cosine"}, {"threshold", threshold},
                 {"neighbor_ids", "shard_local"}, {"document_indices", "shard_local"},
                 {"chunk_offsets", "document_extracted_text_bytes"},
-                {"source_url", file_host_url}, {"shards", nlohmann::json::array()}
+                {"shards", nlohmann::json::array()}
             };
             for (int shard = 0; shard < rank_count; ++shard) {
                 const size_t base = static_cast<size_t>(shard) * 3;

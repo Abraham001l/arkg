@@ -28,4 +28,4 @@ void matrix_mul(vector<float> &embeddings, vector<float> &result, size_t d);
 string save_graph(const csr_graph& csr, const vector<float>& embeddings,
                   const docs_container& docs, const vector<size_t>& doc_indices,
                   const vector<size_t>& chunk_byte_offsets, const vector<size_t>& chunk_byte_lengths,
-                  const string& file_host_url, float threshold);
+                  const string& graph_host_url, float threshold);

@@ -256,8 +256,7 @@ void receive_docs_from_master(docs_container& local_docs, int master_rank) {
 }
 
 void crawl_dir(httplib::Client& client, vector<string>& doc_paths) {
-    const httplib::Params params{{"exclude", ".arkg-graphs"}};
-    const auto res = client.Get("/crawl_dir", params);
+    const auto res = client.Get("/crawl_dir");
 
     if (!res || res->status != 200) {
         throw runtime_error("Failed to crawl the file host's root directory");
